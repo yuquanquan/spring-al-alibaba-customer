@@ -1,0 +1,109 @@
+# ==============================================================================
+# 智能客服系统 - Spring AI Alibaba 配置
+# ==============================================================================
+
+server:
+  port: 8080
+
+spring:
+  application:
+    name: smart-cs
+
+  # ========================
+  # 业务数据库配置 (PostgreSQL)
+  # ========================
+  datasource:
+    # TODO: 请替换为你的实际数据库连接信息
+    url: jdbc:postgresql://localhost:5432/smart_cs
+    username: postgres
+    password: your_password
+    driver-class-name: org.postgresql.Driver
+
+  # ========================
+  # JPA配置: 业务表自动建表
+  # ========================
+  jpa:
+    hibernate:
+      # update: 自动根据Entity创建/更新表结构（开发环境用，生产环境建议用validate）
+      ddl-auto: update
+    show-sql: true
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  # ========================
+  # SQL初始化: 业务表示例数据
+  # ========================
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema.sql
+      # 使用 data.sql 插入初始数据（首次运行后可改为 never）
+      continue-on-error: true
+
+  # ========================
+  # Spring AI - 阿里云 DashScope 配置
+  # ========================
+  ai:
+    dashscope:
+      # TODO: 请替换为你的实际API Key（建议通过环境变量注入）
+      api-key: ${DASHSCOPE_API_KEY:your_api_key_here}
+
+      # 聊天模型配置
+      chat:
+        options:
+          # 通义千问Plus: 性价比较高，支持长上下文
+          model: qwen-plus
+          # 温度: 0~1，越低越确定性，越高越创造性
+          temperature: 0.7
+
+      # 嵌入模型配置（用于向量检索）
+      embedding:
+        options:
+          # text-embedding-v3: 阿里云推荐的多语言嵌入模型，1024维
+          model: text-embedding-v3
+
+    # ========================
+    # PgVector 向量存储配置
+    # 向量数据库和业务数据库共用同一个PostgreSQL实例
+    # ========================
+    vectorstore:
+      pgvector:
+        # 嵌入向量维度（必须与嵌入模型输出维度一致）
+        # text-embedding-v3 = 1024维
+        dimensions: 1024
+        # 索引类型: HNSW (Hierarchical Navigable Small World) - 高维向量检索首选
+        index-type: hnsw
+        # 距离度量: 余弦相似度 (适合文本语义检索)
+        distance-type: cosine
+        # 自动初始化: 自动创建vector_store表和pgvector扩展
+        initialize-schema: true
+        # 表名
+        table-name: vector_store
+        # Top-K默认值
+        top-k: 5
+        # 相似度阈值: 低于此值的结果会被过滤
+        similarity-threshold: 0.5
+
+# ========================
+# 应用自定义配置
+# ========================
+app:
+  # 生成的文档输出目录
+  doc-output-dir: ./output
+  # 知识库文档路径（classpath下）
+  knowledge-base-dir: knowledge-base
+
+# ========================
+# 日志配置
+# ========================
+logging:
+  level:
+    # 打印AI调用详情
+    org.springframework.ai: DEBUG
+    # 打印应用服务日志
+    com.example.smartcs: DEBUG
+    # 打印SQL
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE

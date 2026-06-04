@@ -22,6 +22,9 @@
 
     <properties>
         <java.version>17</java.version>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+        <maven.compiler.encoding>UTF-8</maven.compiler.encoding>
         <spring-ai.version>1.1.2</spring-ai.version>
         <spring-ai-alibaba.version>1.1.2.2</spring-ai-alibaba.version>
         <poi.version>5.2.5</poi.version>
@@ -79,12 +82,31 @@
         </dependency>
 
         <!-- ======================== -->
+        <!-- DashScope SDK: 升级到最新版本以支持新模型（如 qwen3.6-plus） -->
+        <!-- ======================== -->
+        <dependency>
+            <groupId>com.alibaba</groupId>
+            <artifactId>dashscope-sdk-java</artifactId>
+            <version>2.22.4</version>
+        </dependency>
+
+        <!-- ======================== -->
+        <!-- JSON Schema Generator: Spring AI BeanOutputConverter 依赖 -->
+        <!-- ======================== -->
+        <dependency>
+            <groupId>com.github.victools</groupId>
+            <artifactId>jsonschema-generator</artifactId>
+            <version>4.38.0</version>
+        </dependency>
+
+        <!-- ======================== -->
         <!-- 3. Spring AI PgVector Store: 向量存储 -->
         <!--    使用PostgreSQL + pgvector扩展作为向量数据库 -->
+        <!--    注意: Spring AI 1.1.x 命名规范为 spring-ai-starter-vector-store-{name} -->
         <!-- ======================== -->
         <dependency>
             <groupId>org.springframework.ai</groupId>
-            <artifactId>spring-ai-pgvector-store</artifactId>
+            <artifactId>spring-ai-starter-vector-store-pgvector</artifactId>
         </dependency>
 
         <!-- ======================== -->

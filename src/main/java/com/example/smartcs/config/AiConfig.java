@@ -2,7 +2,6 @@ package com.example.smartcs.config;
 
 import com.example.smartcs.model.ChatIntent;
 import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.converter.BeanOutputConverter;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;

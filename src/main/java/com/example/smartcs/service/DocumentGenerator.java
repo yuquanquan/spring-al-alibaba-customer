@@ -1,6 +1,7 @@
 package com.example.smartcs.service;
 
 import com.itextpdf.text.*;
+import com.itextpdf.text.Document;
 import com.itextpdf.text.pdf.BaseFont;
 import com.itextpdf.text.pdf.PdfPCell;
 import com.itextpdf.text.pdf.PdfPTable;
@@ -185,11 +186,11 @@ public class DocumentGenerator {
         table.setWidthPercentage(100);
         table.setWidths(new float[]{2f, 3f, 3f});
 
-        addPdfTableHeader(table, "条件", "说明", "备注", bfChinese);
-        addPdfTableRow(table, "退货时限", "购买后7天内", "超过7天需走售后流程", bfChinese);
-        addPdfTableRow(table, "商品状态", "未使用、未拆封（实体商品）", "虚拟商品不支持退货", bfChinese);
-        addPdfTableRow(table, "退款方式", "原路退回", "1-5个工作日到账", bfChinese);
-        addPdfTableRow(table, "运费承担", "质量问题卖家承担", "非质量问题买家承担", bfChinese);
+        addPdfTableHeader(table, new String[]{"条件", "说明", "备注"}, bfChinese);
+        addPdfTableRow(table, new String[]{"退货时限", "购买后7天内", "超过7天需走售后流程"}, bfChinese);
+        addPdfTableRow(table, new String[]{"商品状态", "未使用、未拆封（实体商品）", "虚拟商品不支持退货"}, bfChinese);
+        addPdfTableRow(table, new String[]{"退款方式", "原路退回", "1-5个工作日到账"}, bfChinese);
+        addPdfTableRow(table, new String[]{"运费承担", "质量问题卖家承担", "非质量问题买家承担"}, bfChinese);
 
         document.add(table);
         document.add(new Paragraph(" ", bodyFont));
@@ -203,12 +204,12 @@ public class DocumentGenerator {
         flowTable.setWidthPercentage(100);
         flowTable.setWidths(new float[]{1f, 4f});
 
-        addPdfTableHeader(flowTable, "步骤", "详细说明", bfChinese);
-        addPdfTableRow(flowTable, "第1步", "联系客服：通过在线客服或电话提交退货申请", bfChinese);
-        addPdfTableRow(flowTable, "第2步", "填写退货单：在系统中填写退货原因和商品信息", bfChinese);
-        addPdfTableRow(flowTable, "第3步", "商家审核：1-3个工作日内审核退货申请", bfChinese);
-        addPdfTableRow(flowTable, "第4步", "寄回商品：审核通过后，按退货地址寄回商品", bfChinese);
-        addPdfTableRow(flowTable, "第5步", "退款处理：收到退货商品后，1-5个工作日退款", bfChinese);
+        addPdfTableHeader(flowTable, new String[]{"步骤", "详细说明"}, bfChinese);
+        addPdfTableRow(flowTable, new String[]{"第1步", "联系客服：通过在线客服或电话提交退货申请"}, bfChinese);
+        addPdfTableRow(flowTable, new String[]{"第2步", "填写退货单：在系统中填写退货原因和商品信息"}, bfChinese);
+        addPdfTableRow(flowTable, new String[]{"第3步", "商家审核：1-3个工作日内审核退货申请"}, bfChinese);
+        addPdfTableRow(flowTable, new String[]{"第4步", "寄回商品：审核通过后，按退货地址寄回商品"}, bfChinese);
+        addPdfTableRow(flowTable, new String[]{"第5步", "退款处理：收到退货商品后，1-5个工作日退款"}, bfChinese);
 
         document.add(flowTable);
         document.add(new Paragraph(" ", bodyFont));

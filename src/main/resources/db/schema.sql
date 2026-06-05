@@ -122,3 +122,23 @@ CREATE TABLE IF NOT EXISTS chat_history (
 
 -- 索引优化：加速会话查询
 CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id, message_index);
+
+-- ========================
+-- 用户事实表（画像记忆 Layer 2）
+-- ========================
+-- 结构化事实存储，永不压缩，只 UPSERT
+-- 解决滚动摘要的"信息衰减"问题
+CREATE TABLE IF NOT EXISTS user_fact (
+    id           BIGSERIAL PRIMARY KEY,
+    session_id   VARCHAR(64) NOT NULL,
+    fact_key     VARCHAR(64) NOT NULL,
+    fact_value   VARCHAR(500) NOT NULL,
+    category     VARCHAR(20) DEFAULT 'ENTITY',
+    importance   INTEGER DEFAULT 3,
+    create_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(session_id, fact_key)
+);
+
+-- 索引优化：加速事实查询
+CREATE INDEX IF NOT EXISTS idx_user_fact_session ON user_fact(session_id);

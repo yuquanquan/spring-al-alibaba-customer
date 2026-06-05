@@ -145,8 +145,14 @@ public class DocumentRetriever {
             log.info("【级联去重】Jaccard相似度去重: {} → {}", beforeJaccard, deduped.size());
         }
 
+        // ================================================================
+        // 【Parent-Child 上下文扩展】
+        // ================================================================
+        // 检索到的是 child chunk（~200 token，语义集中），
+        // 但喂给 LLM 的应该是 parent content（~2000 token，上下文完整）。
+        // 优先取 metadata 中的 parentContent，不存在则回退到 child text。
         List<String> docTexts = deduped.stream()
-            .map(Document::getText)
+            .map(this::getEffectiveContent)
             .collect(Collectors.toList());
 
         log.info("【多路召回-混合增强】最终召回 {} 篇文档", docTexts.size());
@@ -176,15 +182,40 @@ public class DocumentRetriever {
 
         List<Document> docs = vectorSearch(query, DEFAULT_TOP_K, filter);
 
+        // Parent-Child: 优先使用 parent 完整内容
         List<String> docTexts = docs.stream()
             .map(doc -> String.format("[来源:%s, 类型:%s]\n%s",
                 doc.getMetadata().getOrDefault("source", "未知"),
                 doc.getMetadata().getOrDefault("docType", "未知"),
-                doc.getText()))
+                getEffectiveContent(doc)))
             .collect(Collectors.toList());
 
         return new RetrievedContext(docTexts, docTexts.size(),
             "元数据过滤检索(type=" + docType + ")");
+    }
+
+    // ========================
+    // Parent-Child 工具方法
+    // ========================
+
+    /**
+     * 获取文档的有效内容（Parent-Child 分块适配）
+     * <p>
+     * 如果使用 Parent-Child 分块策略:
+     * - child.getText() 只有约 200 token（语义集中，用于精准检索）
+     * - metadata.parentContent 有约 2000 token（上下文完整，喂给 LLM）
+     * <p>
+     * 本方法优先返回 parentContent，不存在时回退到 child text。
+     *
+     * @param doc 检索到的文档（可能是 child chunk）
+     * @return 优先返回 parent 完整内容，回退到 child text
+     */
+    private String getEffectiveContent(Document doc) {
+        Object parentContent = doc.getMetadata().get("parentContent");
+        if (parentContent instanceof String s && !s.isBlank()) {
+            return s;
+        }
+        return doc.getText();
     }
 
     // ========================

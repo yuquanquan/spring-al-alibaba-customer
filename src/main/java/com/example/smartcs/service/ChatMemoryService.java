@@ -3,11 +3,6 @@ package com.example.smartcs.service;
 import com.example.smartcs.entity.ChatHistory;
 import com.example.smartcs.repository.ChatHistoryRepository;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.ai.chat.client.ChatClient;
-import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,29 +12,26 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 /**
- * 对话记忆服务（长期记忆 + 记忆压缩）
+ * 对话记忆服务（长期记忆持久化 + 事实提取触发）
  * <p>
  * ========================================================================
- * 【学习要点: 对话记忆】
+ * 【企业级设计: 两层记忆架构】
  * ========================================================================
- * 多轮对话需要记忆历史上下文，否则 AI 会"失忆"。
- * <p>
- * 两级记忆架构：
- * 1. 短期记忆（Short-term Memory）:
- *    - 存储在内存中（MessageWindowChatMemory）
- *    - 保留最近 N 条消息（滑动窗口，自动淘汰旧消息）
- *    - 会话结束后自动释放
- *    - 由 ChatService 直接调用 shortTermMemory.add()/get()
- * <p>
- * 2. 长期记忆（Long-term Memory）:
- *    - 持久化到 PostgreSQL（本类负责）
- *    - 跨会话保留（用户下次登录仍可恢复上下文）
- *    - 支持记忆压缩（减少 Token 消耗）
- * <p>
- * 3. 记忆压缩（Memory Compression）:
- *    - 当历史消息超过阈值时，调用 LLM 总结对话
- *    - 用"摘要"替代原始对话，节省 Token
- *    - 例如：100条消息 → 1段总结（Token 从 5000 → 200）
+ * <pre>
+ * Layer 1: 工作记忆（Redis 滑动窗口）
+ *   - 由 RedisChatMemoryRepository + MessageWindowChatMemory 管理
+ *   - 最近10条消息，Redis List 存储
+ *   - 由 ChatService 直接调用 shortTermMemory.add()/get()
+ *
+ * Layer 2: 画像记忆（结构化事实，永不压缩）
+ *   - 由 FactExtractor 管理
+ *   - 本类负责触发: 当未压缩消息达到阈值时，触发事实提取
+ *   - 事实 UPSERT 到 Redis Hash + PostgreSQL
+ *
+ * 为什么删除了滚动摘要（情景层）:
+ *   - 画像层已覆盖摘要的全部价值（结构化事实 > 叙述性摘要）
+ *   - 删除后: 省一半 LLM 调用开销，提示词更精简
+ * </pre>
  */
 @Slf4j
 @Service
@@ -49,16 +41,10 @@ public class ChatMemoryService {
     private ChatHistoryRepository historyRepo;
 
     @Autowired
-    private ChatClient chatClient;
+    private FactExtractor factExtractor;
 
-    /** 短期记忆窗口大小（消息数） */
-    private static final int SHORT_TERM_WINDOW = 10;
-
-    /** 触发压缩的消息数阈值 */
+    /** 触发事实提取的消息数阈值 */
     private static final int COMPRESSION_THRESHOLD = 20;
-
-    /** 压缩后保留的总结消息角色 */
-    private static final String SUMMARY_ROLE = "SYSTEM";
 
     /**
      * 保存用户消息到长期记忆
@@ -97,86 +83,53 @@ public class ChatMemoryService {
     }
 
     /**
-     * 获取完整历史记忆（包括已压缩的总结）
-     * <p>
-     * 用于长期对话恢复或深度分析
+     * 获取完整历史记忆
      */
     public List<ChatHistory> getFullHistory(String sessionId) {
         return historyRepo.findBySessionIdOrderByMessageIndexAsc(sessionId);
     }
 
     /**
-     * 检查并执行记忆压缩
+     * 检查并触发事实提取（画像记忆 Layer 2）
      * <p>
-     * 当未压缩消息数超过阈值时，触发压缩流程：
-     * 1. 提取所有未压缩的历史消息
-     * 2. 调用 LLM 生成总结
-     * 3. 保存总结为 SYSTEM 消息
-     * 4. 标记旧消息为已压缩
-     * 5. 删除已压缩的旧消息（可选，节省空间）
+     * ====================================================================
+     * 【企业级优化: 只做事实提取，删除滚动摘要】
+     * ====================================================================
+     * <pre>
+     * 之前: 压缩摘要(1次LLM) + 事实提取(1次LLM) = 2次调用/20条消息
+     * 现在: 只做事实提取(1次LLM) = 1次调用/20条消息
+     *
+     * 画像记忆（Layer 2）是核心:
+     *   - 结构化事实永不压缩，只 UPSERT
+     *   - "user_name=张三" 在第1轮和第2000轮都一样精确
+     *   - 滚动摘要已删除 — 画像层覆盖了摘要的全部价值
+     * </pre>
      */
     @Transactional
     public void compressIfNeeded(String sessionId) {
         long uncompressedCount = historyRepo.countBySessionId(sessionId);
 
         if (uncompressedCount >= COMPRESSION_THRESHOLD) {
-            log.info("【记忆压缩】触发压缩: sessionId={}, 消息数={}", sessionId, uncompressedCount);
+            log.info("【事实提取】触发: sessionId={}, 消息数={}", sessionId, uncompressedCount);
 
-            // 步骤1: 获取未压缩的历史
+            // 获取未压缩的历史
             List<ChatHistory> uncompressedHistory = historyRepo.findUncompressedHistory(sessionId);
 
-            // 步骤2: 构建压缩 Prompt
             String conversationText = uncompressedHistory.stream()
                 .map(h -> h.getRole() + ": " + h.getContent())
                 .collect(Collectors.joining("\n"));
 
-            String summary = summarizeConversation(conversationText);
+            // ===== 核心: 只做事实提取（画像记忆 Layer 2）=====
+            factExtractor.extractAndSaveFacts(sessionId, conversationText);
 
-            // 步骤3: 保存总结
-            ChatHistory summaryMsg = new ChatHistory();
-            summaryMsg.setSessionId(sessionId);
-            summaryMsg.setRole(SUMMARY_ROLE);
-            summaryMsg.setContent("【对话总结】\n" + summary);
-            summaryMsg.setMessageIndex(getNextMessageIndex(sessionId));
-            summaryMsg.setTokenCount(estimateTokens(summary));
-            summaryMsg.setCreateTime(LocalDateTime.now());
-            summaryMsg.setCompressed(true);  // 总结本身不压缩
-
-            historyRepo.save(summaryMsg);
-
-            // 步骤4: 标记旧消息为已压缩
+            // 标记旧消息为已压缩
             for (ChatHistory h : uncompressedHistory) {
                 h.setCompressed(true);
             }
             historyRepo.saveAll(uncompressedHistory);
 
-            // 步骤5: 删除已压缩的旧消息（可选，根据存储策略决定）
-            // historyRepo.deleteBySessionIdAndCompressedTrue(sessionId);
-
-            log.info("【记忆压缩】完成: 原{}条消息 → 1条总结", uncompressedCount);
+            log.info("【事实提取】完成: {}条消息已压缩", uncompressedCount);
         }
-    }
-
-    /**
-     * 使用 LLM 总结对话历史
-     */
-    private String summarizeConversation(String conversation) {
-        String prompt = String.format("""
-            请对以下对话历史进行简洁总结，提取关键信息：
-            
-            %s
-            
-            要求：
-            1. 用一段话概括对话主题和结论
-            2. 保留重要的事实信息（如订单号、用户名等）
-            3. 控制在 200 字以内
-            4. 不要包含无关的寒暄内容
-            """, conversation);
-
-        return chatClient.prompt()
-            .user(prompt)
-            .call()
-            .content();
     }
 
     /**
@@ -188,22 +141,18 @@ public class ChatMemoryService {
 
     /**
      * 估算 Token 数量（简化版）
-     * <p>
-     * 生产环境建议使用 Tiktoken 库进行精确计算
      */
     private int estimateTokens(String text) {
-        // 粗略估算：中文约 1 字符 = 1.5 token，英文约 4 字符 = 1 token
         int chineseChars = (int) text.chars().filter(c -> c >= 0x4E00 && c <= 0x9FFF).count();
         int otherChars = text.length() - chineseChars;
         return (int) (chineseChars * 1.5 + otherChars / 4);
     }
 
-    /**
-     * 清空会话记忆
-     */
+    /** 清空会话记忆（含画像事实） */
     @Transactional
     public void clearMemory(String sessionId) {
         historyRepo.deleteBySessionIdAndCompressedTrue(sessionId);
-        log.info("【记忆清理】清空会话: {}", sessionId);
+        factExtractor.clearFacts(sessionId);
+        log.info("【记忆清理】清空会话（含画像事实）: {}", sessionId);
     }
 }

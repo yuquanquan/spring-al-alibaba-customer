@@ -375,27 +375,144 @@ public class DocumentEtlPipeline {
     }
 
     /**
-     * 文档切块 (Chunking)
+     * 文档切块 (Chunking) —— Parent-Child 父子分块策略
      * <p>
-     * 使用 Spring AI 内置的 TokenTextSplitter，基于 Token 数量进行智能切块。
+     * ========================================================================
+     * 【学习要点: Chunk 切分方案对比】
+     * ========================================================================
+     *
+     * 方案1: TokenTextSplitter（固定Token切分）
+     * - 原理: 按 token 数量 + 分隔符优先级切分（\n\n > \n > 。 > ，）
+     * - 优点: 简单通用，Spring AI 内置
+     * - 缺点: 不考虑语义边界，可能把一段完整论述切断
+     * - 适用: 原型验证、小项目
+     *
+     * 方案2: 语义分块 (Semantic Chunker)
+     * - 原理: 用 embedding 相似度判断语义断点，相邻句子相似度低的地方切分
+     * - 优点: 语义完整，不会切断上下文
+     * - 缺点: 计算成本高（需要先对所有句子做 embedding）
+     * - 适用: 长文档、技术文档
+     *
+     * 方案3: 结构化分块 (Structured Chunker)
+     * - 原理: 按文档结构切分 — Markdown按标题、HTML按div、代码按函数、表格按行
+     * - 优点: 保留文档逻辑层次，每个 chunk 语义自洽
+     * - 缺点: 需要解析文档格式，不同格式需不同实现
+     * - 适用: FAQ（按问答对）、政策文档（按章节）、代码（按函数）
+     *
+     * 方案4: 递归字符分块 (Recursive Character) — LangChain 默认方案
+     * - 原理: 按优先级递归尝试分隔符: \n\n → \n → 。 → ，
+     * - 优点: 通用性好，比固定 token 切分更尊重语义边界
+     * - 缺点: 本质仍基于字符数，不真正理解语义
+     * - 适用: 通用场景
+     *
+     * ★ 方案5: Parent-Child 父子分块（当前实现，企业级首选）
+     * - 原理: 大块(2000token)给 LLM 阅读，小块(200token)做向量检索
+     * - 优点:
+     *   ✅ 检索精准: 小 chunk embedding 语义集中，不会被稀释
+     *   ✅ 上下文完整: LLM 看到的是父级完整段落，减少幻觉
+     *   ✅ 成本可控: 只给命中的 chunk 扩展为父级，不是所有都扩展
+     * - 缺点:
+     *   ❌ 存储翻倍: 每个 child 的 metadata 存一份 parent 文本
+     *   ❌ 实现复杂: 需要维护父子关系，检索侧需适配
+     * - 适用: 生产环境首选，尤其适合需要精准检索+完整上下文的场景
+     *
+     * 方案6: 滑动窗口重叠
+     * - 原理: 大块 + 50% overlap，避免切断关键信息
+     * - 优点: 几乎不丢上下文，简单有效
+     * - 缺点: chunk 数量翻倍，存储和检索成本增加
+     * - 适用: 法律合同、医疗报告（信息不能丢）
+     *
+     * ========================================================================
+     * 【Parent-Child 分块流程】
+     * ========================================================================
+     * <pre>
+     *   原始文档
+     *      │
+     *      ▼ TokenTextSplitter(2000 tokens)
+     *   ┌──────────────────────────────────────────┐
+     *   │  Parent Chunk 1 (~2000 tokens)            │
+     *   │  ┌─────────┐ ┌─────────┐ ┌─────────┐    │
+     *   │  │Child 1a │ │Child 1b │ │Child 1c │    │ ← 每个约 200 tokens
+     *   │  └─────────┘ └─────────┘ └─────────┘    │
+     *   └──────────────────────────────────────────┘
+     *   ┌──────────────────────────────────────────┐
+     *   │  Parent Chunk 2 (~2000 tokens)            │
+     *   │  ┌─────────┐ ┌─────────┐                  │
+     *   │  │Child 2a │ │Child 2b │                  │
+     *   │  └─────────┘ └─────────┘                  │
+     *   └──────────────────────────────────────────┘
+     * </pre>
      * <p>
-     * 切块原理：
-     * - 优先在分隔符处切分（\n\n > \n > 。 > ，）
-     * - 保证每块不超过 maxTokenSize
-     * - 相邻块有 overlap 重叠，保证上下文连贯
+     * 检索流程:
+     * 1. 用小 chunk 做向量检索（语义集中 → 精准命中）
+     * 2. 命中后从 metadata 取 parentContent（完整上下文）
+     * 3. 把 parent content 喂给 LLM（回答更完整，减少幻觉）
      *
      * @param documents 待切块的文档列表
-     * @return 切块后的文档列表
+     * @return 切块后的 child 文档列表（每个 child 的 metadata 包含 parentContent）
      */
     private List<Document> splitDocuments(List<Document> documents) {
-        // TokenTextSplitter 参数:
-        // defaultChunkSize=800: 默认每块约800个token
-        // minChunkSizeChars=350: 每块最少350个字符（太小的块合并到相邻块）
-        // minChunkLengthToEmbed=50: 最短50个字符才会被嵌入向量
-        // maxNumChunks=10000: 单文档最多切10000块
-        // keepSeparator=true: 保留分隔符（保持语义完整性）
-        TokenTextSplitter splitter = new TokenTextSplitter(800, 350, 50, 10000, true);
-        return splitter.transform(documents);
+        // ============================================================
+        // Step 1: 切分父块（Parent Chunks）—— 大块，给 LLM 用
+        // ============================================================
+        // parentChunkSize=2000: 每块约 2000 token，保证段落完整性
+        // parentMinChunkSizeChars=800: 每块最少 800 字符
+        TokenTextSplitter parentSplitter = new TokenTextSplitter(
+            2000,  // defaultChunkSize: 父块大小
+            800,   // minChunkSizeChars: 最小字符数
+            50,    // minChunkLengthToEmbed: 最短 50 字符才嵌入
+            10000, // maxNumChunks: 单文档最多块数
+            true   // keepSeparator: 保留分隔符
+        );
+        List<Document> parentChunks = parentSplitter.transform(documents);
+        log.info("【Parent-Child】父块数: {}", parentChunks.size());
+
+        // ============================================================
+        // Step 2: 对每个父块切分子块（Child Chunks）—— 小块，做向量检索
+        // ============================================================
+        // childChunkSize=200: 每块约 200 token，语义集中 → 检索精准
+        // childMinChunkSizeChars=50: 最小 50 字符
+        TokenTextSplitter childSplitter = new TokenTextSplitter(
+            200,   // defaultChunkSize: 子块大小
+            50,    // minChunkSizeChars: 最小字符数
+            50,    // minChunkLengthToEmbed: 最短 50 字符才嵌入
+            10000, // maxNumChunks: 单文档最多块数
+            true   // keepSeparator: 保留分隔符
+        );
+
+        List<Document> childChunks = new ArrayList<>();
+        for (int parentIdx = 0; parentIdx < parentChunks.size(); parentIdx++) {
+            Document parent = parentChunks.get(parentIdx);
+            String parentId = "parent-" + UUID.randomUUID();
+            String parentContent = parent.getText();
+
+            // 对父块做子切分
+            List<Document> children = childSplitter.transform(List.of(parent));
+
+            for (int childIdx = 0; childIdx < children.size(); childIdx++) {
+                Document child = children.get(childIdx);
+                Map<String, Object> meta = new HashMap<>(child.getMetadata());
+
+                // 关键: 在子块的 metadata 中存入父块完整内容
+                meta.put("parentContent", parentContent);
+                meta.put("parentId", parentId);
+                meta.put("childIndex", childIdx);
+                meta.put("parentIndex", parentIdx);
+
+                // 创建新的 Document（Spring AI 1.1.x 的 id 不可变）
+                childChunks.add(new Document(
+                    UUID.randomUUID().toString(),
+                    Objects.requireNonNull(child.getText()),
+                    meta
+                ));
+            }
+        }
+
+        log.info("【Parent-Child】子块数: {}（平均每个父块 {} 个子块）",
+            childChunks.size(),
+            parentChunks.isEmpty() ? 0 : childChunks.size() / parentChunks.size());
+
+        return childChunks;
     }
 
     /**
@@ -429,12 +546,13 @@ public class DocumentEtlPipeline {
             doc.getMetadata().put("chunkIndex", i);
             doc.getMetadata().put("totalChunks", totalChunks);
             // 溯源型元数据（pageRange、sectionTitle、docTitle）
-            // 已在denoise阶段提取到metadata中，这里由TokenTextSplitter自动继承
+            // 已在denoise阶段提取到metadata中，由父块→子块自动继承
             // 如果某些chunk缺少溯源信息，补充默认值
             doc.getMetadata().putIfAbsent("pageRange", "unknown");
             doc.getMetadata().putIfAbsent("sectionTitle", "unknown");
             // 设置唯一ID: Spring AI 1.1.x Document的id是不可变的，
             // 需要通过构造函数 Document(id, text, metadata) 重新创建
+            // 注意: parentContent 已在 splitDocuments() 的 Parent-Child 分块中写入 metadata
             String uniqueId = UUID.randomUUID().toString();
             documents.set(i, new Document(uniqueId, Objects.requireNonNull(doc.getText()), doc.getMetadata()));
         }
@@ -499,7 +617,9 @@ public class DocumentEtlPipeline {
         return docs.stream().map(doc -> {
             Map<String, Object> result = new LinkedHashMap<>();
             result.put("id", doc.getId());
-            result.put("content", doc.getText().substring(0, Math.min(200, doc.getText().length())) + "...");
+            // 优先展示 parentContent（Parent-Child 分块时的父块完整内容）
+            String displayText = (String) doc.getMetadata().getOrDefault("parentContent", doc.getText());
+            result.put("content", displayText.substring(0, Math.min(200, displayText.length())) + "...");
             result.put("metadata", doc.getMetadata());
             return result;
         }).collect(Collectors.toList());

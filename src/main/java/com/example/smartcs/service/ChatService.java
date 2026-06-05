@@ -4,7 +4,12 @@ import com.example.smartcs.config.PromptTemplates;
 import com.example.smartcs.model.*;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.stereotype.Service;
+
+import java.util.List;
 
 /**
  * 智能客服核心编排服务
@@ -61,30 +66,41 @@ public class ChatService {
     private final QueryRewriter queryRewriter;
     private final DocumentRetriever documentRetriever;
     private final DatabaseQueryService databaseQueryService;
+    private final ChatMemoryService chatMemoryService;
+    private final MessageWindowChatMemory shortTermMemory;  // 短期记忆（滑动窗口）
 
     public ChatService(ChatClient chatClient,
                        IntentRecognizer intentRecognizer,
                        QueryRewriter queryRewriter,
                        DocumentRetriever documentRetriever,
-                       DatabaseQueryService databaseQueryService) {
+                       DatabaseQueryService databaseQueryService,
+                       ChatMemoryService chatMemoryService,
+                       MessageWindowChatMemory shortTermMemory) {
         this.chatClient = chatClient;
         this.intentRecognizer = intentRecognizer;
         this.queryRewriter = queryRewriter;
         this.documentRetriever = documentRetriever;
         this.databaseQueryService = databaseQueryService;
+        this.chatMemoryService = chatMemoryService;
+        this.shortTermMemory = shortTermMemory;  // 注入短期记忆
     }
 
     /**
-     * 核心对话入口
+     * 核心对话入口（带记忆功能）
      * <p>
      * 串联意图识别 → Query改写 → 多路召回/NL2SQL → 生成回答 的完整链路
      *
+     * @param sessionId 会话ID（用于记忆管理）
      * @param question 用户输入的问题
      * @return AI 生成的回答
      */
-    public String chat(String question) {
+    public String chat(String sessionId, String question) {
         log.info("══════════════════════════════════════");
-        log.info("【智能客服】用户问题: {}", question);
+        log.info("【智能客服】会话: {}, 用户问题: {}", sessionId, question);
+
+        // ===== 步骤0: 保存用户消息到两级记忆 =====
+        shortTermMemory.add(sessionId, new org.springframework.ai.chat.messages.UserMessage(question));  // 短期记忆（内存）
+        chatMemoryService.saveUserMessage(sessionId, question);  // 长期记忆（数据库）
 
         // ===== 步骤1: 意图识别 =====
         // 快速路径: 简单问候直接走闲聊，避免 LLM 调用延迟
@@ -97,20 +113,34 @@ public class ChatService {
         log.info("【意图识别】→ {}", intent.intentType().getDescription());
 
         // ===== 步骤2: 根据意图路由到不同处理链路 =====
-        return switch (intent.intentType()) {
-            case CHAT -> handleChat(question);
-            case RAG -> handleRagQuery(question);
-            case DB_QUERY -> handleDbQuery(question);
+        String answer = switch (intent.intentType()) {
+            case CHAT -> handleChat(sessionId, question);
+            case RAG -> handleRagQuery(sessionId, question);
+            case DB_QUERY -> handleDbQuery(sessionId, question);
         };
+
+        // ===== 步骤3: 保存AI回复到两级记忆 =====
+        shortTermMemory.add(sessionId, new org.springframework.ai.chat.messages.AssistantMessage(answer));  // 短期记忆
+        chatMemoryService.saveAssistantMessage(sessionId, answer);  // 长期记忆
+
+        // ===== 步骤4: 检查是否需要压缩记忆 =====
+        chatMemoryService.compressIfNeeded(sessionId);
+
+        return answer;
     }
 
     /**
      * 处理闲聊意图
      * 直接由 LLM 回复，不走检索或数据库查询
      */
-    private String handleChat(String question) {
+    private String handleChat(String sessionId, String question) {
         log.info("【闲聊路由】直接回复");
+
+        // 获取短期记忆（从内存滑动窗口中读取最近10条）
+        List<Message> history = shortTermMemory.get(sessionId);
+
         return chatClient.prompt()
+            .messages(history)  // 注入历史消息
             .user(question)
             .call()
             .content();
@@ -127,7 +157,7 @@ public class ChatService {
      * 3. 上下文构建: 将检索到的文档拼接为上下文
      * 4. LLM生成: 将上下文 + 用户问题 注入 Prompt，让 LLM 基于真实数据回答
      */
-    private String handleRagQuery(String question) {
+    private String handleRagQuery(String sessionId, String question) {
         log.info("【RAG路由】开始 RAG 全链路处理");
 
         // Step 1: Query改写
@@ -154,7 +184,7 @@ public class ChatService {
      * <p>
      * NL2SQL 链路: 自然语言 → SQL生成 → 执行查询 → 结果解读
      */
-    private String handleDbQuery(String question) {
+    private String handleDbQuery(String sessionId, String question) {
         log.info("【DB路由】开始 NL2SQL 数据库查询");
 
         // Step 1: NL2SQL + 执行查询

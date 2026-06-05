@@ -2,6 +2,7 @@ package com.example.smartcs.service;
 
 import com.example.smartcs.model.QueryRewriteResult;
 import com.example.smartcs.model.RetrievedContext;
+import com.example.smartcs.search.HybridSearchService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
@@ -48,6 +49,7 @@ import java.util.stream.Collectors;
 public class DocumentRetriever {
 
     private final VectorStore vectorStore;
+    private final HybridSearchService hybridSearchService;
 
     /** 默认返回的文档数量 */
     private static final int DEFAULT_TOP_K = 5;
@@ -60,47 +62,54 @@ public class DocumentRetriever {
     /** n-gram大小: 中文推荐2~4 */
     private static final int NGRAM_SIZE = 3;
 
-    public DocumentRetriever(VectorStore vectorStore) {
+    public DocumentRetriever(VectorStore vectorStore, HybridSearchService hybridSearchService) {
         this.vectorStore = vectorStore;
+        this.hybridSearchService = hybridSearchService;
     }
 
     /**
      * 多路召回: 使用原始查询 + 改写查询 + 子查询 进行检索
      * <p>
-     * 这是核心的检索方法，综合多种策略最大化召回率。
+     * 【增强版】现在每路检索都使用混合检索（向量 + BM25），而非纯向量检索。
+     * <p>
+     * 完整流程：
+     * 1. Query改写生成多个查询版本
+     * 2. 每个查询版本执行混合检索（向量+BM25，RRF融合）
+     * 3. 合并所有路的结果，按文档ID去重
+     * 4. 执行三级级联去重（ID去重 → 内容去重 → Jaccard去重）
      *
      * @param query 原始查询
      * @param rewriteResult Query改写结果（包含改写版本和子查询）
      * @return 合并去重后的检索上下文
      */
     public RetrievedContext multiWayRetrieve(String query, QueryRewriteResult rewriteResult) {
-        log.info("【多路召回】开始检索，原始查询: {}", query);
+        log.info("【多路召回-混合增强】开始检索，原始查询: {}", query);
 
         // 使用 LinkedHashMap 去重（key=文档ID）并保持插入顺序
         Map<String, Document> allDocs = new LinkedHashMap<>();
 
-        // ============ 路径1: 原始查询向量检索 ============
-        List<Document> originalDocs = vectorSearch(query, DEFAULT_TOP_K, null);
+        // ============ 路径1: 原始查询混合检索（向量+BM25） ============
+        List<Document> originalDocs = hybridSearchService.hybridSearch(query, DEFAULT_TOP_K);
         originalDocs.forEach(doc -> allDocs.putIfAbsent(doc.getId(), doc));
-        log.info("【多路召回-路径1】原始查询召回 {} 篇文档", originalDocs.size());
+        log.info("【多路召回-路径1】原始查询混合检索召回 {} 篇文档", originalDocs.size());
 
-        // ============ 路径2: 改写查询向量检索 ============
+        // ============ 路径2: 改写查询混合检索 ============
         if (rewriteResult != null && rewriteResult.rewrittenQueries() != null) {
             for (String rewritten : rewriteResult.rewrittenQueries()) {
                 if (!rewritten.equals(query)) {
-                    List<Document> docs = vectorSearch(rewritten, 3, null);
+                    List<Document> docs = hybridSearchService.hybridSearch(rewritten, 3);
                     docs.forEach(doc -> allDocs.putIfAbsent(doc.getId(), doc));
-                    log.debug("【多路召回-路径2】改写查询'{}'召回 {} 篇文档", rewritten, docs.size());
+                    log.debug("【多路召回-路径2】改写查询'{}'混合检索召回 {} 篇文档", rewritten, docs.size());
                 }
             }
         }
 
-        // ============ 路径3: 子查询向量检索 ============
+        // ============ 路径3: 子查询混合检索 ============
         if (rewriteResult != null && rewriteResult.subQueries() != null) {
             for (String subQuery : rewriteResult.subQueries()) {
-                List<Document> docs = vectorSearch(subQuery, 3, null);
+                List<Document> docs = hybridSearchService.hybridSearch(subQuery, 3);
                 docs.forEach(doc -> allDocs.putIfAbsent(doc.getId(), doc));
-                log.debug("【多路召回-路径3】子查询'{}'召回 {} 篇文档", subQuery, docs.size());
+                log.debug("【多路召回-路径3】子查询'{}'混合检索召回 {} 篇文档", subQuery, docs.size());
             }
         }
 
@@ -140,8 +149,8 @@ public class DocumentRetriever {
             .map(Document::getText)
             .collect(Collectors.toList());
 
-        log.info("【多路召回】最终召回 {} 篇文档", docTexts.size());
-        return new RetrievedContext(docTexts, docTexts.size(), "多路召回(原始+改写+子查询)");
+        log.info("【多路召回-混合增强】最终召回 {} 篇文档", docTexts.size());
+        return new RetrievedContext(docTexts, docTexts.size(), "多路召回(原始+改写+子查询)×混合检索(向量+BM25)");
     }
 
     /**

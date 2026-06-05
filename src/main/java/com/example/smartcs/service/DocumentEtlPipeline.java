@@ -1,5 +1,6 @@
 package com.example.smartcs.service;
 
+import com.example.smartcs.search.HybridSearchService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentTransformer;
@@ -81,12 +82,14 @@ import java.util.stream.Collectors;
 public class DocumentEtlPipeline {
 
     private final VectorStore vectorStore;
+    private final HybridSearchService hybridSearchService;
 
     @Value("classpath:knowledge-base/*.md")
     private Resource[] knowledgeBaseResources;
 
-    public DocumentEtlPipeline(VectorStore vectorStore) {
+    public DocumentEtlPipeline(VectorStore vectorStore, HybridSearchService hybridSearchService) {
         this.vectorStore = vectorStore;
+        this.hybridSearchService = hybridSearchService;
     }
 
     /**
@@ -144,6 +147,9 @@ public class DocumentEtlPipeline {
         if (!allDocuments.isEmpty()) {
             vectorStore.add(allDocuments);
             log.info("【ETL-Load】知识库加载完成，共 {} 个文档块", allDocuments.size());
+            
+            // 同步到 BM25 索引（用于混合检索）
+            hybridSearchService.syncBM25Index(allDocuments);
         }
 
         return allDocuments.size();

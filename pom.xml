@@ -135,7 +135,21 @@
         </dependency>
 
         <!-- ======================== -->
-        <!-- 7. Apache POI: Word文档生成 (.docx) -->
+        <!-- 7. Spring Data Redis: 分布式会话记忆存储 -->
+        <!-- ======================== -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!-- Spring AI Redis ChatMemory: 官方提供的 Redis-backed 记忆实现 -->
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-chat-memory-redis</artifactId>
+        </dependency>
+
+        <!-- ======================== -->
+        <!-- 8. Apache POI: Word文档生成 (.docx) -->
         <!-- ======================== -->
         <dependency>
             <groupId>org.apache.poi</groupId>

@@ -23,16 +23,18 @@ public class ChatController {
     }
 
     /**
-     * 同步对话接口
+     * 同步对话接口（带记忆）
      * <p>
      * 完整链路: 意图识别 → Query改写 → 多路召回/NL2SQL → 生成回答
      *
-     * @param question 用户问题
+     * @param request 请求体（包含问题 + 可选的sessionId）
      * @return AI 回答
      */
     @PostMapping
     public ChatApiResponse chat(@RequestBody ChatApiRequest request) {
-        String answer = chatService.chat(request.question());
+        // 如果没有提供 sessionId，使用默认值（单用户场景）
+        String sessionId = request.sessionId() != null ? request.sessionId() : "default-session";
+        String answer = chatService.chat(sessionId, request.question());
         return new ChatApiResponse(answer);
     }
 
@@ -44,17 +46,19 @@ public class ChatController {
      *
      * @param question 用户问题
      * @param docType 文档类型过滤（可选）
+     * @param sessionId 会话ID（可选，用于多轮对话记忆）
      * @return AI 回答
      */
     @PostMapping("/filter")
     public ChatApiResponse chatWithFilter(
             @RequestParam String question,
-            @RequestParam(required = false) String docType) {
+            @RequestParam(required = false) String docType,
+            @RequestParam(required = false, defaultValue = "default-session") String sessionId) {
         if (docType != null && !docType.isEmpty()) {
             String answer = chatService.chatWithDocTypeFilter(question, docType);
             return new ChatApiResponse(answer);
         }
-        String answer = chatService.chat(question);
+        String answer = chatService.chat(sessionId, question);
         return new ChatApiResponse(answer);
     }
 
@@ -64,15 +68,17 @@ public class ChatController {
      * 使用 SSE 协议逐字推送 AI 回答，实现"打字机"效果。
      * 适用于前端实时显示 AI 生成过程。
      * <p>
-     * 使用方式: 浏览器访问 /api/chat/stream?question=你好
-     * 或使用 EventSource: new EventSource('/api/chat/stream?question=你好')
+     * 使用方式: 浏览器访问 /api/chat/stream?question=你好&sessionId=user123
+     * 或使用 EventSource: new EventSource('/api/chat/stream?question=你好&sessionId=user123')
      */
     @GetMapping(value = "/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public Flux<String> chatStream(@RequestParam String question) {
+    public Flux<String> chatStream(
+            @RequestParam String question,
+            @RequestParam(required = false, defaultValue = "default-session") String sessionId) {
         // 注意: 这里简化为同步调用后按字符拆分
         // 生产环境应使用 chatClient.prompt().stream().content() 实现真正的流式输出
         return Flux.defer(() -> {
-            String answer = chatService.chat(question);
+            String answer = chatService.chat(sessionId, question);
             return Flux.fromArray(answer.split("(?<=.)"))
                 .delayElements(java.time.Duration.ofMillis(30));
         });
@@ -82,6 +88,6 @@ public class ChatController {
     // 请求/响应 DTO
     // ========================
 
-    public record ChatApiRequest(String question) {}
+    public record ChatApiRequest(String question, String sessionId) {}
     public record ChatApiResponse(String answer) {}
 }

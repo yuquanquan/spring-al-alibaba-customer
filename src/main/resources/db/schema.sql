@@ -105,3 +105,20 @@ INSERT INTO sys_order_item (order_id, product_name, quantity, unit_price, subtot
 (4, '多语言支持包-年付',     1,  299.00,  299.00),
 (5, '私有化部署标准版',      1, 12999.00, 12999.00)
 ON CONFLICT DO NOTHING;
+
+-- ========================
+-- 对话历史表（长期记忆）
+-- ========================
+CREATE TABLE IF NOT EXISTS chat_history (
+    id              BIGSERIAL PRIMARY KEY,
+    session_id      VARCHAR(64) NOT NULL,
+    role            VARCHAR(20) NOT NULL,
+    content         TEXT NOT NULL,
+    message_index   INTEGER NOT NULL,
+    token_count     INTEGER,
+    create_time     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    compressed      BOOLEAN DEFAULT FALSE
+);
+
+-- 索引优化：加速会话查询
+CREATE INDEX IF NOT EXISTS idx_chat_history_session ON chat_history(session_id, message_index);

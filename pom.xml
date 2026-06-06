@@ -191,7 +191,16 @@
         </dependency>
 
         <!-- ======================== -->
-        <!-- 11. Lombok: 简化Java样板代码 -->
+        <!-- 11. JSqlParser: SQL AST 解析（NL2SQL 白名单安全校验） -->
+        <!-- ======================== -->
+        <dependency>
+            <groupId>com.github.jsqlparser</groupId>
+            <artifactId>jsqlparser</artifactId>
+            <version>5.0</version>
+        </dependency>
+
+        <!-- ======================== -->
+        <!-- 12. Lombok: 简化Java样板代码 -->
         <!-- ======================== -->
         <dependency>
             <groupId>org.projectlombok</groupId>

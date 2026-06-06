@@ -33,6 +33,24 @@ spring:
         format_sql: true
 
   # ========================
+  # Redis配置: 分布式会话记忆存储
+  # ========================
+  data:
+    redis:
+      # TODO: 请替换为你的实际Redis连接信息
+      host: ${REDIS_HOST:0.0.0.0}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:0000}
+      database: 0
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+          max-wait: -1ms
+
+  # ========================
   # SQL初始化: 业务表示例数据
   # ========================
   sql:
@@ -48,15 +66,17 @@ spring:
   ai:
     dashscope:
       # TODO: 请替换为你的实际API Key（建议通过环境变量注入）
-      api-key: ${DASHSCOPE_API_KEY:your_api_key_here}
+      api-key: ${DASHSCOPE_API_KEY:sk-***}
 
       # 聊天模型配置
       chat:
         options:
-          # 通义千问Plus: 性价比较高，支持长上下文
-          model: qwen-plus
+          # qwen3.6-plus: 通义千问3.6 Plus，支持标准ChatModel接口（多模态模型）
+          model: qwen3.6-plus
           # 温度: 0~1，越低越确定性，越高越创造性
           temperature: 0.7
+          # 启用多模态支持（qwen3.6-plus 需要）
+          multi-model: true
 
       # 嵌入模型配置（用于向量检索）
       embedding:
@@ -74,9 +94,9 @@ spring:
         # text-embedding-v3 = 1024维
         dimensions: 1024
         # 索引类型: HNSW (Hierarchical Navigable Small World) - 高维向量检索首选
-        index-type: hnsw
+        index-type: HNSW
         # 距离度量: 余弦相似度 (适合文本语义检索)
-        distance-type: cosine
+        distance-type: COSINE_DISTANCE
         # 自动初始化: 自动创建vector_store表和pgvector扩展
         initialize-schema: true
         # 表名
@@ -94,6 +114,26 @@ app:
   doc-output-dir: ./output
   # 知识库文档路径（classpath下）
   knowledge-base-dir: knowledge-base
+
+  # 对话记忆配置
+  chat-memory:
+    # 滑动窗口大小（保留最近N条消息）
+    window-size: 10
+    # Redis中记忆的过期时间（秒），默认24小时
+    ttl-seconds: 86400
+
+  # Rerank 重排序配置
+  rerank:
+    # 重排序模型（DashScope gte-rerank 交叉编码器）
+    model: gte-rerank
+    # 重排序后返回的文档数
+    top-n: 5
+    # API超时时间（毫秒）
+    timeout-ms: 5000
+    # 启用 Rerank 模型的知识库文档数阈值
+    # 知识库 < 此值 → 用 RRF 累加分数排序（零 API 调用，足够用）
+    # 知识库 ≥ 此值 → 调 DashScope gte-rerank 交叉编码器精排（~200ms）
+    kb-docs-threshold: 500
 
 # ========================
 # 日志配置

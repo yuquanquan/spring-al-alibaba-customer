@@ -1,6 +1,7 @@
 package com.example.smartcs.service;
 
 import com.example.smartcs.config.PromptTemplates;
+import com.example.smartcs.config.SqlSecurityValidator;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.model.ChatModel;
@@ -11,30 +12,23 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * 数据库查询服务 (NL2SQL)
+ * 数据库查询服务 (NL2SQL —— 受控版本)
  * <p>
  * ========================================================================
- * 【学习要点: 自然语言转SQL (NL2SQL)】
+ * 【学习要点: 受控 NL2SQL —— JSqlParser AST 白名单校验】
  * ========================================================================
- * NL2SQL 是将用户的自然语言问题自动转换为 SQL 查询的技术。
  * <p>
- * 实现流程:
- * 1. 将表结构（DDL）+ 用户问题 注入 Prompt
- * 2. LLM 生成 SQL 语句
- * 3. 安全校验（只允许 SELECT，防止注入）
- * 4. 执行 SQL 获取结果
- * 5. 将结果传回 LLM 生成自然语言回答
+ * 本类是 Function Calling 的降级方案：
+ * <pre>
+ *   用户问 "张三的订单" → DatabaseTools.queryOrdersByUser()   ← 预定义工具（安全）
+ *   用户问 "上月退货率最高的产品" → 本类.queryByNaturalLanguage() ← NL2SQL（灵活）
+ * </pre>
  * <p>
- * 安全考虑:
- * - 只允许 SELECT 语句
- * - SQL 注入检测
- * - 查询超时限制
- * - 结果行数限制
- * <p>
- * 进阶方向:
- * - 使用 Function Calling / Tool Use 让 LLM 直接调用查询方法
- * - 预定义查询模板（更安全，但灵活性较低）
- * - 混合方案：常见查询用模板，复杂查询用 NL2SQL
+ * 安全升级（对比旧版正则黑名单）：
+ * <pre>
+ *   旧: 正则黑名单 → SELECT * FROM users; -- DROP TABLE   ← 可能绕过
+ *   新: JSqlParser AST 白名单 → 解析语法树，只允许白名单表和列 ← 无法绕过
+ * </pre>
  */
 @Slf4j
 @Service
@@ -43,21 +37,15 @@ public class DatabaseQueryService {
     private final JdbcTemplate jdbcTemplate;
     private final ChatModel chatModel;
 
-    /** SQL安全黑名单: 禁止这些操作 */
-    private static final List<String> SQL_BLACKLIST = List.of(
-        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
-        "CREATE", "TRUNCATE", "EXEC", "GRANT", "REVOKE"
-    );
-
     public DatabaseQueryService(JdbcTemplate jdbcTemplate, ChatModel chatModel) {
         this.jdbcTemplate = jdbcTemplate;
         this.chatModel = chatModel;
     }
 
     /**
-     * 自然语言查询业务数据
+     * 自然语言查询业务数据（受控 NL2SQL）
      * <p>
-     * 完整链路: 用户问题 → LLM生成SQL → 安全校验 → 执行查询 → 格式化结果
+     * 完整链路: 用户问题 → LLM生成SQL → JSqlParser白名单校验 → 执行查询 → 格式化结果
      *
      * @param question 用户的自然语言问题
      * @return 查询结果字符串
@@ -69,13 +57,16 @@ public class DatabaseQueryService {
         String sql = generateSql(question);
         log.info("【NL2SQL】生成的SQL: {}", sql);
 
-        // 步骤2: 安全校验
-        if (!isSafeSql(sql)) {
-            log.warn("【NL2SQL】SQL安全检查未通过: {}", sql);
+        // 步骤2: JSqlParser AST 白名单校验（替代旧的正则黑名单）
+        if (!SqlSecurityValidator.isSafe(sql)) {
+            log.warn("【NL2SQL】SQL安全校验未通过: {}", sql);
             return "抱歉，生成的查询语句未通过安全检查，请换一种方式描述您的问题。";
         }
 
-        // 步骤3: 执行查询
+        // 步骤3: 添加 LIMIT（如果没有）
+        sql = ensureLimit(sql, SqlSecurityValidator.getMaxRows());
+
+        // 步骤4: 执行查询（带超时保护）
         try {
             List<Map<String, Object>> results = jdbcTemplate.queryForList(sql);
             log.info("【NL2SQL】查询返回 {} 条记录", results.size());
@@ -94,9 +85,6 @@ public class DatabaseQueryService {
 
     /**
      * 使用 LLM 生成 SQL 查询语句
-     * <p>
-     * 将表结构信息和用户问题一起注入 Prompt，
-     * 让 LLM 理解数据模型后生成准确的 SQL。
      */
     private String generateSql(String question) {
         ChatClient client = ChatClient.builder(chatModel).build();
@@ -108,7 +96,6 @@ public class DatabaseQueryService {
             .call()
             .content();
 
-        // 清理 SQL（移除代码块标记和多余空白）
         return response
             .replaceAll("```sql\\s*", "")
             .replaceAll("```\\s*", "")
@@ -116,53 +103,108 @@ public class DatabaseQueryService {
     }
 
     /**
-     * SQL 安全校验
-     * <p>
-     * 只允许 SELECT 查询，禁止任何数据修改操作。
-     * 生产环境还应该:
-     * - 使用 SQL Parser 做更严格的安全分析
-     * - 限制可查询的表
-     * - 设置查询超时
-     * - 限制返回行数
+     * 确保 SQL 有 LIMIT 限制（防止返回过多数据）
      */
-    private boolean isSafeSql(String sql) {
-        if (sql == null || sql.trim().isEmpty()) {
-            return false;
+    private String ensureLimit(String sql, int maxRows) {
+        String upper = sql.toUpperCase().trim();
+        if (!upper.contains("LIMIT")) {
+            return sql + " LIMIT " + maxRows;
         }
+        return sql;
+    }
 
-        String upperSql = sql.toUpperCase().trim();
+    // ========================
+    // 预定义查询方法（业务逻辑层 —— 唯一的业务代码位置）
+    // DatabaseTools 的 @Tool 方法通过调用这些方法实现薄代理
+    // ========================
 
-        // 必须以 SELECT 开头
-        if (!upperSql.startsWith("SELECT")) {
-            return false;
-        }
-
-        // 检查黑名单
-        for (String keyword : SQL_BLACKLIST) {
-            // 使用正则确保是独立关键词（避免误判如 "SELECTED"）
-            if (upperSql.matches(".*\\b" + keyword + "\\b.*")) {
-                return false;
-            }
-        }
-
-        return true;
+    /**
+     * 按订单号查询订单详情
+     */
+    public String queryOrderByNo(String orderNo) {
+        log.info("【订单查询】按订单号: {}", orderNo);
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+            "SELECT o.order_no, o.total_amount, o.status, o.description, o.create_time, " +
+            "u.username, u.email " +
+            "FROM sys_order o LEFT JOIN sys_user u ON o.user_id = u.id " +
+            "WHERE o.order_no = ?",
+            orderNo
+        );
+        return results.isEmpty()
+            ? "未找到订单号为 " + orderNo + " 的订单。请确认订单号是否正确。"
+            : formatResults(results);
     }
 
     /**
-     * 格式化查询结果为可读的文本
+     * 按用户名查询订单列表
      */
-    private String formatResults(List<Map<String, Object>> results) {
+    public String queryOrdersByUser(String username) {
+        log.info("【订单查询】按用户名: {}", username);
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+            "SELECT o.order_no, o.total_amount, o.status, o.description, o.create_time " +
+            "FROM sys_order o JOIN sys_user u ON o.user_id = u.id " +
+            "WHERE u.username = ? ORDER BY o.create_time DESC LIMIT 50",
+            username
+        );
+        return results.isEmpty()
+            ? "用户 " + username + " 暂无订单记录。"
+            : formatResults(results);
+    }
+
+    /**
+     * 按状态查询订单列表
+     */
+    public String queryOrdersByStatus(String status) {
+        log.info("【订单查询】按状态: {}", status);
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+            "SELECT o.order_no, u.username, o.total_amount, o.status, o.description, o.create_time " +
+            "FROM sys_order o JOIN sys_user u ON o.user_id = u.id " +
+            "WHERE o.status = ? ORDER BY o.create_time DESC LIMIT 50",
+            status.toUpperCase()
+        );
+        return results.isEmpty()
+            ? "没有状态为 " + status + " 的订单。"
+            : formatResults(results);
+    }
+
+    /**
+     * 查询所有用户
+     */
+    public String queryAllUsers() {
+        log.info("【用户查询】查询全部用户");
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+            "SELECT id, username, email, phone, role, status, create_time FROM sys_user ORDER BY id LIMIT 100"
+        );
+        return results.isEmpty() ? "系统中暂无用户数据。" : formatResults(results);
+    }
+
+    /**
+     * 查询权限列表
+     */
+    public String queryPermissions() {
+        log.info("【权限查询】查询全部权限配置");
+        List<Map<String, Object>> results = jdbcTemplate.queryForList(
+            "SELECT id, name, code, type, parent_id FROM sys_permission ORDER BY parent_id, id"
+        );
+        return results.isEmpty() ? "系统中暂无权限配置。" : formatResults(results);
+    }
+
+    // ========================
+    // 内部工具方法
+    // ========================
+
+    /**
+     * 格式化查询结果为可读的文本（public 供 Tool 层复用）
+     */
+    public String formatResults(List<Map<String, Object>> results) {
         StringBuilder sb = new StringBuilder();
 
-        // 添加表头
         if (!results.isEmpty()) {
             sb.append("查询到 ").append(results.size()).append(" 条记录:\n\n");
-            // 列名
             sb.append("| ").append(String.join(" | ", results.get(0).keySet())).append(" |\n");
             sb.append("|").append("-".repeat(results.get(0).size() * 12)).append("|\n");
         }
 
-        // 添加数据行
         for (Map<String, Object> row : results) {
             sb.append("| ");
             for (Object value : row.values()) {
@@ -172,65 +214,5 @@ public class DatabaseQueryService {
         }
 
         return sb.toString();
-    }
-
-    // ========================
-    // 直接查询方法（供 Function Calling 使用）
-    // ========================
-
-    /**
-     * 按订单号查询订单
-     * 可以直接被 LLM Function Calling 调用
-     */
-    public String queryOrderByNo(String orderNo) {
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(
-            "SELECT o.*, u.username FROM sys_order o LEFT JOIN sys_user u ON o.user_id = u.id WHERE o.order_no = ?",
-            orderNo
-        );
-        return results.isEmpty() ? "未找到订单: " + orderNo : formatResults(results);
-    }
-
-    /**
-     * 按用户名查询订单
-     */
-    public String queryOrdersByUser(String username) {
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(
-            "SELECT o.order_no, o.total_amount, o.status, o.description, o.create_time " +
-            "FROM sys_order o JOIN sys_user u ON o.user_id = u.id WHERE u.username = ?",
-            username
-        );
-        return results.isEmpty() ? "用户 " + username + " 暂无订单" : formatResults(results);
-    }
-
-    /**
-     * 按状态查询订单
-     */
-    public String queryOrdersByStatus(String status) {
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(
-            "SELECT o.order_no, u.username, o.total_amount, o.status, o.description " +
-            "FROM sys_order o JOIN sys_user u ON o.user_id = u.id WHERE o.status = ?",
-            status
-        );
-        return results.isEmpty() ? "没有状态为 " + status + " 的订单" : formatResults(results);
-    }
-
-    /**
-     * 查询所有用户
-     */
-    public String queryAllUsers() {
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(
-            "SELECT id, username, email, phone, role, status, create_time FROM sys_user"
-        );
-        return formatResults(results);
-    }
-
-    /**
-     * 查询权限列表
-     */
-    public String queryPermissions() {
-        List<Map<String, Object>> results = jdbcTemplate.queryForList(
-            "SELECT id, name, code, type, parent_id FROM sys_permission ORDER BY parent_id, id"
-        );
-        return formatResults(results);
     }
 }

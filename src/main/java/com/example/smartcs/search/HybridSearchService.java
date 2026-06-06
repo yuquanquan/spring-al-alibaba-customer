@@ -162,16 +162,34 @@ public class HybridSearchService {
         
         log.debug("【混合检索-RRF】融合后文档数: {}", sortedDocIds.size());
         
-        // ===== 步骤5: 根据 ID 获取完整文档 =====
+        // ===== 步骤5: 根据 ID 获取完整文档 + 注入 RRF 分数 =====
+        // ========================================================================
+        // 【学习要点: RRF 分数透传】
+        // ========================================================================
+        // hybridSearch 内部已经算好了 RRF 分数，但之前返回 List<Document> 时分数丢了。
+        // 现在把分数存入 Document.metadata("rrfScore")，让上层 DocumentRetriever
+        // 在合并多路结果时能够累加分数、最终按分数排序。
+        //
+        //   路径1 hybridSearch("原始查询")  → doc A: rrfScore=0.032
+        //   路径2 hybridSearch("改写查询")  → doc A: rrfScore=0.016
+        //   合并后: doc A 的累加分数 = 0.048（出现在多路中 = 更相关）
+        // ========================================================================
         
         // 构建向量结果的快速查找表
         Map<String, Document> vectorDocMap = vectorResults.stream()
             .filter(doc -> doc.getId() != null)
             .collect(Collectors.toMap(Document::getId, doc -> doc, (a, b) -> a));
         
-        // 按排序后的 ID 顺序返回文档
+        // 按排序后的 ID 顺序返回文档，并注入 RRF 分数
         List<Document> finalResults = sortedDocIds.stream()
-            .map(vectorDocMap::get)
+            .map(docId -> {
+                Document doc = vectorDocMap.get(docId);
+                if (doc != null) {
+                    // 将 RRF 分数存入 metadata，供多路合并时累加使用
+                    doc.getMetadata().put("rrfScore", rrfScores.getOrDefault(docId, 0.0));
+                }
+                return doc;
+            })
             .filter(Objects::nonNull)
             .collect(Collectors.toList());
         

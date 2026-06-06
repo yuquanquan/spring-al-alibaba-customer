@@ -68,7 +68,7 @@ public class ChatService {
     private final IntentRecognizer intentRecognizer;
     private final QueryRewriter queryRewriter;
     private final DocumentRetriever documentRetriever;
-    private final DatabaseQueryService databaseQueryService;
+    private final DatabaseTools databaseTools;                          // Function Calling 工具集
     private final ChatMemory shortTermMemory;                     // 工作记忆（Redis 滑动窗口）
     private final ApplicationEventPublisher eventPublisher;       // 事件发布器
     private final FactExtractor factExtractor;                    // 画像记忆（Layer 2）
@@ -77,7 +77,7 @@ public class ChatService {
                        IntentRecognizer intentRecognizer,
                        QueryRewriter queryRewriter,
                        DocumentRetriever documentRetriever,
-                       DatabaseQueryService databaseQueryService,
+                       DatabaseTools databaseTools,
                        ChatMemory shortTermMemory,
                        ApplicationEventPublisher eventPublisher,
                        FactExtractor factExtractor) {
@@ -85,7 +85,7 @@ public class ChatService {
         this.intentRecognizer = intentRecognizer;
         this.queryRewriter = queryRewriter;
         this.documentRetriever = documentRetriever;
-        this.databaseQueryService = databaseQueryService;
+        this.databaseTools = databaseTools;
         this.shortTermMemory = shortTermMemory;
         this.eventPublisher = eventPublisher;
         this.factExtractor = factExtractor;
@@ -216,19 +216,43 @@ public class ChatService {
     }
 
     /**
-     * 处理数据库查询
+     * 处理数据库查询（Function Calling 版本）
      * <p>
-     * NL2SQL 链路: 自然语言 → SQL生成 → 执行查询 → 结果解读
+     * ========================================================================
+     * 【学习要点: Function Calling 完整闭环】
+     * ========================================================================
+     * <pre>
+     * 旧方案（NL2SQL，2次额外LLM调用）:
+     *   LLM#1: 生成 SQL → 执行 → LLM#2: 解读结果
+     *
+     * 新方案（Function Calling，1次LLM调用）:
+     *   LLM 看到工具列表 → 自动选择工具 → Spring AI 执行 → 结果回传 LLM → 生成回答
+     *
+     * 工具选择策略:
+     *   "张三的订单" → queryOrdersByUser("张三")          ← 预定义工具（80%场景）
+     *   "上月退货率最高的产品" → securedNl2SqlQuery(...)   ← 受控NL2SQL（20%场景）
+     * </pre>
      */
     private String handleDbQuery(String sessionId, String question) {
-        log.info("【DB路由】开始 NL2SQL 数据库查询");
+        log.info("【DB路由】开始 Function Calling 数据库查询");
 
-        // Step 1: NL2SQL + 执行查询
-        String queryResult = databaseQueryService.queryByNaturalLanguage(question);
-        log.info("【DB-Step1】查询结果: {} 字符", queryResult.length());
+        // 获取长期记忆上下文（画像记忆）
+        String longTermContext = buildLongTermContext(sessionId);
 
-        // Step 2: 让 LLM 解读查询结果
-        return buildDbQueryResponse(sessionId, question, queryResult);
+        // 构建带工具的 ChatClient 调用
+        // .tools(databaseTools) 将 @Tool 注解的方法注册为 LLM 可调用的工具
+        // Spring AI 自动处理: LLM选择工具 → 执行Java方法 → 结果回传LLM → 生成回答
+        var promptSpec = chatClient.prompt()
+            .user(question)
+            .tools(databaseTools);  // 注册 DatabaseTools 中的所有 @Tool 方法
+
+        if (longTermContext != null && !longTermContext.isBlank()) {
+            promptSpec = promptSpec.system(longTermContext);
+        }
+
+        String answer = promptSpec.call().content();
+        log.info("【Function Calling】完成，回答长度: {} 字符", answer != null ? answer.length() : 0);
+        return answer;
     }
 
     /**
@@ -265,17 +289,15 @@ public class ChatService {
     }
 
     /**
-     * 构建数据库查询回答
+     * 构建数据库查询回答（保留供外部调用，如 Controller 中的 filter 接口）
      * <p>
-     * 将 SQL 查询结果传回 LLM，让 LLM 将结构化数据转化为自然语言回答。
-     * 同时注入长期记忆，确保 LLM 了解用户的历史背景。
+     * 注意: handleDbQuery 已改用 Function Calling，本方法仅作为备用。
      */
     private String buildDbQueryResponse(String sessionId, String question, String queryResult) {
         String prompt = PromptTemplates.DB_QUERY_ANSWER
             .replace("{question}", question)
             .replace("{result}", queryResult);
 
-        // 注入长期记忆上下文
         String longTermContext = buildLongTermContext(sessionId);
         if (longTermContext != null && !longTermContext.isBlank()) {
             return chatClient.prompt()
@@ -285,13 +307,10 @@ public class ChatService {
                 .content();
         }
 
-        String response = chatClient.prompt()
+        return chatClient.prompt()
             .user(prompt)
             .call()
             .content();
-
-        log.info("【DB查询完成】回答长度: {} 字符", response.length());
-        return response;
     }
 
     /**

@@ -270,7 +270,7 @@ curl -X POST http://localhost:8080/api/chat \
 
 ---
 
-## 学习路线图
+## 参考路线图
 
 ### 第一阶段：RAG 基础 ✅
 
@@ -290,7 +290,7 @@ curl -X POST http://localhost:8080/api/chat \
 - [x] Function Calling（@Tool 薄代理架构）
 - [x] NL2SQL 安全校验（JSqlParser AST 白名单）
 
-### 第三阶段：Agent 框架（计划中）
+### 第三阶段：Agent 框架（ing）
 
 - [ ] Spring AI Alibaba Agent Framework（ReAct / Planner-Executor）
 - [ ] MCP（Model Context Protocol）

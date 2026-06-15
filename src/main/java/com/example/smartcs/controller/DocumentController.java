@@ -39,18 +39,37 @@ public class DocumentController {
     }
 
     /**
-     * 初始化知识库
+     * 初始化知识库（首次调用 = 全量加载，后续调用 = 自动增量同步）
      * <p>
-     * 加载 classpath:knowledge-base/ 下的所有 Markdown 文档到向量存储。
-     * 应用启动后需要调用一次此接口来初始化知识库。
+     * 首次：加载 classpath:knowledge-base/ 下所有 Markdown 文档 + 建立索引快照
+     * 后续：对比源文件 hash，只处理新增/修改/删除的文档
      */
     @PostMapping("/init")
     public Map<String, Object> initKnowledgeBase() {
         int count = etlPipeline.initializeKnowledgeBase();
         return Map.of(
             "status", "success",
-            "message", "知识库初始化完成",
+            "message", count > 0 ? "知识库初始化完成" : "知识库已是最新，无需更新",
             "documentChunks", count
+        );
+    }
+
+    /**
+     * 增量同步知识库（显式触发）
+     * <p>
+     * 对比磁盘文件与已索引快照的 hash 值：
+     * - 新增文档 → 向量化 + 入库
+     * - 修改文档 → 删除旧向量 + 重新向量化
+     * - 删除文档 → 清理旧向量
+     * - 未变化文档 → 跳过（省 embedding 成本）
+     */
+    @PostMapping("/sync")
+    public Map<String, Object> syncKnowledgeBase() {
+        Map<String, Integer> stats = etlPipeline.syncKnowledgeBase();
+        return Map.of(
+            "status", "success",
+            "message", "增量同步完成",
+            "stats", stats
         );
     }
 

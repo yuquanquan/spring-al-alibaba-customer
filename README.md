@@ -23,7 +23,6 @@
 | 文档生成 | Apache POI (Word) + iTextPDF (PDF) |
 
 ---
-
 ## 技术栈
 
 | 组件 | 选型 | 版本 |
@@ -270,6 +269,22 @@ curl -X POST http://localhost:8080/api/chat \
 
 ---
 
+## 监控技术栈
+Spring Boot Actuator + Prometheus + Grafana
+```
+RAG 系统                    Actuator 健康监控推送                    Prometheus 普罗米修斯
+┌─────────────┐              ┌──────────────┐             ┌────────────┐
+│ ChatService │ ──记录指标──→ │ /actuator/   │ ──定时抓取──→│ 存储指标   │
+│ (埋点)      │              │   prometheus │             │            │
+└─────────────┘              └──────────────┘             └────────────┘
+↓
+Grafana
+┌──────────┐
+│ 可视化   │
+│ 仪表盘   │
+└──────────┘
+```
+
 ## 学习路线图
 
 ### 第一阶段：RAG 基础 ✅
@@ -290,7 +305,7 @@ curl -X POST http://localhost:8080/api/chat \
 - [x] Function Calling（@Tool 薄代理架构）
 - [x] NL2SQL 安全校验（JSqlParser AST 白名单）
 
-### 第三阶段：Agent 框架（计划中）
+### 第三阶段：Agent 框架 todo
 
 - [ ] Spring AI Alibaba Agent Framework（ReAct / Planner-Executor）
 - [ ] MCP（Model Context Protocol）

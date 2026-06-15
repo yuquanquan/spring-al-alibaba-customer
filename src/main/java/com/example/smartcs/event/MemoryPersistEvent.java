@@ -4,6 +4,7 @@ import lombok.Getter;
 import org.springframework.context.ApplicationEvent;
 
 import java.time.LocalDateTime;
+import java.time.ZoneOffset;
 
 /**
  * 记忆持久化事件
@@ -27,13 +28,11 @@ public class MemoryPersistEvent extends ApplicationEvent {
     private final String sessionId;
     private final String role;        // USER 用户会话/ ASSISTANT 回复内容
     private final String content;
-    private final LocalDateTime timestamp;
 
     public MemoryPersistEvent(Object source, String sessionId, String role, String content) {
         super(source);
         this.sessionId = sessionId;
         this.role = role;
         this.content = content;
-        this.timestamp = LocalDateTime.now();
     }
 }

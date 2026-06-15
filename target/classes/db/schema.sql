@@ -9,6 +9,18 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 -- ========================
+-- vector_store 表扩展：添加 tsvector 全文检索列
+-- ========================
+-- PostgreSQL 16+ 支持 GENERATED ALWAYS AS 自动维护
+-- 老版本 PostgreSQL 请用 TRIGGER + tsvector_update_trigger() 替代
+ALTER TABLE IF EXISTS vector_store
+    ADD COLUMN IF NOT EXISTS ts_content tsvector
+    GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
+
+-- 创建 GIN 倒排索引加速全文检索
+CREATE INDEX IF NOT EXISTS idx_fts_ts_content ON vector_store USING GIN(ts_content);
+
+-- ========================
 -- 用户表
 -- ========================
 CREATE TABLE IF NOT EXISTS sys_user (
@@ -142,3 +154,19 @@ CREATE TABLE IF NOT EXISTS user_fact (
 
 -- 索引优化：加速事实查询
 CREATE INDEX IF NOT EXISTS idx_user_fact_session ON user_fact(session_id);
+
+-- ========================
+-- 知识库索引追踪表（增量同步核心）
+-- ========================
+-- 记录每个源文件的索引状态，用于增量同步时判断文档是否需要重新向量化
+CREATE TABLE IF NOT EXISTS knowledge_base_index (
+    id               BIGSERIAL PRIMARY KEY,
+    source_file      VARCHAR(500) NOT NULL UNIQUE,
+    content_hash     VARCHAR(64) NOT NULL,
+    chunk_ids        TEXT,
+    chunk_count      INTEGER NOT NULL,
+    file_modified_at TIMESTAMP,
+    version          INTEGER NOT NULL DEFAULT 1,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

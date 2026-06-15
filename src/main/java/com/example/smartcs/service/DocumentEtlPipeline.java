@@ -1,16 +1,22 @@
 package com.example.smartcs.service;
 
+import com.example.smartcs.entity.KnowledgeBaseIndex;
+import com.example.smartcs.repository.KnowledgeBaseIndexRepository;
 import com.example.smartcs.search.HybridSearchService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.document.DocumentTransformer;
 import org.springframework.ai.reader.TextReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.Resource;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
+import java.security.MessageDigest;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -83,13 +89,20 @@ public class DocumentEtlPipeline {
 
     private final VectorStore vectorStore;
     private final HybridSearchService hybridSearchService;
+    private final KnowledgeBaseIndexRepository indexRepository;
+    private final JdbcTemplate jdbcTemplate;
 
     @Value("classpath:knowledge-base/*.md")
     private Resource[] knowledgeBaseResources;
 
-    public DocumentEtlPipeline(VectorStore vectorStore, HybridSearchService hybridSearchService) {
+    public DocumentEtlPipeline(VectorStore vectorStore,
+                               HybridSearchService hybridSearchService,
+                               KnowledgeBaseIndexRepository indexRepository,
+                               JdbcTemplate jdbcTemplate) {
         this.vectorStore = vectorStore;
         this.hybridSearchService = hybridSearchService;
+        this.indexRepository = indexRepository;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     /**
@@ -100,10 +113,172 @@ public class DocumentEtlPipeline {
      * 2. Transform: 去噪 → 切块 → 添加元数据
      * 3. Load: 存入 PgVector 向量存储
      *
-     * @return 加载的文档块总数
+     * @return 文档差异统计（新增/修改/跳过/删除）的 JSON 字符串
+     */
+    public Map<String, Integer> syncKnowledgeBase() {
+        log.info("【ETL-Incr】开始增量同步知识库...");
+
+        // ===== 步骤0: 加载旧索引快照（sourceFile → KnowledgeBaseIndex） =====
+        Map<String, KnowledgeBaseIndex> oldIndexMap = indexRepository.findAll().stream()
+            .collect(Collectors.toMap(KnowledgeBaseIndex::getSourceFile, idx -> idx));
+        log.info("【ETL-Incr】已索引文档: {} 篇", oldIndexMap.size());
+
+        // ===== 步骤1: 扫描当前文件，计算 hash，分类 =====
+        Map<String, Resource> currentFiles = new LinkedHashMap<>();
+        for (Resource resource : knowledgeBaseResources) {
+            String filename = resource.getFilename();
+            if (filename != null) {
+                currentFiles.put(filename, resource);
+            }
+        }
+        log.info("【ETL-Incr】当前磁盘文档: {} 篇", currentFiles.size());
+
+        // 分类结果
+        List<Resource> newFiles = new ArrayList<>();       // 新文件（磁盘有，索引无）
+        List<Resource> modifiedFiles = new ArrayList<>();   // 修改文件（hash 变了）
+        List<String> deletedFiles = new ArrayList<>();      // 删除文件（索引有，磁盘无）
+        List<String> unchangedFiles = new ArrayList<>();    // 未变化（跳过，省 embedding 成本）
+        int totalNewChunks = 0;
+
+        for (Map.Entry<String, Resource> entry : currentFiles.entrySet()) {
+            String filename = entry.getKey();
+            Resource resource = entry.getValue();
+
+            try {
+                // 读取原始文本并计算去噪后的 hash
+                TextReader reader = new TextReader(resource);
+                List<Document> rawDocs = reader.read();
+                String rawText = rawDocs.stream().map(Document::getText).collect(Collectors.joining("\n"));
+                String currentHash = computeMD5(rawText);
+
+                KnowledgeBaseIndex oldIndex = oldIndexMap.get(filename);
+
+                if (oldIndex == null) {
+                    // 场景1: 新文件
+                    newFiles.add(resource);
+                    log.info("【ETL-Incr】[新增] {}", filename);
+                } else if (!currentHash.equals(oldIndex.getContentHash())) {
+                    // 场景2: 内容已修改
+                    modifiedFiles.add(resource);
+                    // 先删除旧向量
+                    deleteChunksBySource(filename, oldIndex);
+                    log.info("【ETL-Incr】[修改] {} (旧hash={} → 新hash={})",
+                        filename, oldIndex.getContentHash().substring(0, 8), currentHash.substring(0, 8));
+                } else {
+                    // 场景3: 未变化
+                    unchangedFiles.add(filename);
+                    log.debug("【ETL-Incr】[跳过] {} (hash 未变)", filename);
+                }
+            } catch (Exception e) {
+                log.error("【ETL-Incr】文件分析失败 {}: {}", filename, e.getMessage());
+            }
+        }
+
+        // 场景4: 已删除的文件（索引中有但磁盘没有）
+        for (String indexedFile : oldIndexMap.keySet()) {
+            if (!currentFiles.containsKey(indexedFile)) {
+                deletedFiles.add(indexedFile);
+                KnowledgeBaseIndex oldIndex = oldIndexMap.get(indexedFile);
+                deleteChunksBySource(indexedFile, oldIndex);
+                log.info("【ETL-Incr】[删除] {} ({} 个 chunk)", indexedFile,
+                    oldIndex.getChunkCount());
+            }
+        }
+
+        // ===== 步骤2: 处理新增和修改的文件（执行完整 ETL 管道） =====
+        List<Resource> toProcess = new ArrayList<>();
+        toProcess.addAll(newFiles);
+        toProcess.addAll(modifiedFiles);
+
+        if (!toProcess.isEmpty()) {
+            log.info("【ETL-Incr】需要处理 {} 个文件（新增 {} + 修改 {}）",
+                toProcess.size(), newFiles.size(), modifiedFiles.size());
+
+            for (Resource resource : toProcess) {
+                try {
+                    String filename = resource.getFilename();
+                    log.info("【ETL-Incr】处理文档: {}", filename);
+
+                    TextReader reader = new TextReader(resource);
+                    List<Document> rawDocs = reader.read();
+                    List<Document> denoisedDocs = denoise(rawDocs);
+                    List<Document> chunks = splitDocuments(denoisedDocs);
+                    addMetadata(chunks, filename);
+
+                    // 计算 hash（使用去噪后的纯文本）
+                    String rawText = rawDocs.stream().map(Document::getText).collect(Collectors.joining("\n"));
+                    String contentHash = computeMD5(rawText);
+
+                    // 记录 chunk IDs
+                    List<String> chunkIdList = chunks.stream()
+                        .map(Document::getId)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList());
+                    String chunkIdsJson = "[\"" + String.join("\",\"", chunkIdList) + "\"]";
+
+                    // 向量化 + 写入向量库
+                    int batchSize = 10;
+                    for (int i = 0; i < chunks.size(); i += batchSize) {
+                        int end = Math.min(i + batchSize, chunks.size());
+                        vectorStore.add(chunks.subList(i, end));
+                    }
+
+                    // 更新/新增索引记录
+                    KnowledgeBaseIndex newIndex = KnowledgeBaseIndex.builder()
+                        .sourceFile(filename)
+                        .contentHash(contentHash)
+                        .chunkIds(chunkIdsJson)
+                        .chunkCount(chunks.size())
+                        .fileModifiedAt(getFileModifiedTime(resource))
+                        .version(oldIndexMap.containsKey(filename)
+                            ? oldIndexMap.get(filename).getVersion() + 1 : 1)
+                        .build();
+                    indexRepository.deleteBySourceFile(filename);
+                    indexRepository.save(newIndex);
+
+                    totalNewChunks += chunks.size();
+                    log.info("【ETL-Incr】文档处理完成: {} → {} 个 chunk", filename, chunks.size());
+
+                } catch (Exception e) {
+                    log.error("【ETL-Incr】处理文档失败 {}: {}", resource.getFilename(), e.getMessage());
+                }
+            }
+
+        }
+
+        // ===== 统计 =====
+        Map<String, Integer> stats = new LinkedHashMap<>();
+        stats.put("new", newFiles.size());
+        stats.put("modified", modifiedFiles.size());
+        stats.put("unchanged", unchangedFiles.size());
+        stats.put("deleted", deletedFiles.size());
+        stats.put("totalChunksAdded", totalNewChunks);
+
+        log.info("【ETL-Incr】增量同步完成: 新增{} / 修改{} / 跳过{} / 删除{} / 新增chunk{}个",
+            stats.get("new"), stats.get("modified"),
+            stats.get("unchanged"), stats.get("deleted"), stats.get("totalChunksAdded"));
+
+        return stats;
+    }
+
+    /**
+     * 初始化知识库（首次加载，兼容旧接口）
+     * <p>
+     * 首次调用 → 全量加载 + 建立索引
+     * 后续调用 → 自动走增量同步
      */
     public int initializeKnowledgeBase() {
-        log.info("【ETL】开始初始化知识库...");
+        long indexedCount = indexRepository.count();
+        
+        if (indexedCount > 0) {
+            // 已有索引，走增量同步
+            log.info("【ETL】检测到已有 {} 篇索引，自动切换为增量同步模式", indexedCount);
+            Map<String, Integer> stats = syncKnowledgeBase();
+            return stats.getOrDefault("totalChunksAdded", 0);
+        }
+
+        // 首次加载：全量但依然建立索引（便于后续增量同步）
+        log.info("【ETL】首次初始化，全量加载...");
 
         List<Document> allDocuments = new ArrayList<>();
 
@@ -145,14 +320,141 @@ public class DocumentEtlPipeline {
 
         // ---- Step 5: 加载到向量存储 (Load) ----
         if (!allDocuments.isEmpty()) {
-            vectorStore.add(allDocuments);
+            // DashScope Embedding API 限制单次 batch 最多 10 条文档
+            // 分批处理，每批 10 条
+            int batchSize = 10;
+            for (int i = 0; i < allDocuments.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, allDocuments.size());
+                List<Document> batch = allDocuments.subList(i, end);
+                vectorStore.add(batch);
+                log.info("【ETL-Load】批量加载 {}/{} ~ {}/{}", 
+                    i + 1, end, allDocuments.size(), allDocuments.size());
+            }
             log.info("【ETL-Load】知识库加载完成，共 {} 个文档块", allDocuments.size());
-            
-            // 同步到 BM25 索引（用于混合检索）
-            hybridSearchService.syncBM25Index(allDocuments);
+        }
+
+        // ===== 步骤6: 为每个文件建立索引记录（后续增量同步的基础） =====
+        for (Resource resource : knowledgeBaseResources) {
+            try {
+                String filename = resource.getFilename();
+                if (filename == null) continue;
+
+                TextReader reader = new TextReader(resource);
+                List<Document> rawDocs = reader.read();
+                String rawText = rawDocs.stream().map(Document::getText).collect(Collectors.joining("\n"));
+                String contentHash = computeMD5(rawText);
+
+                // 统计该文件的 chunk 数和 ID 列表
+                List<String> chunkIdsForFile = allDocuments.stream()
+                    .filter(d -> filename.equals(d.getMetadata().get("source")))
+                    .map(Document::getId)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+
+                if (!chunkIdsForFile.isEmpty()) {
+                    indexRepository.save(KnowledgeBaseIndex.builder()
+                        .sourceFile(filename)
+                        .contentHash(contentHash)
+                        .chunkIds("[\"" + String.join("\",\"", chunkIdsForFile) + "\"]")
+                        .chunkCount(chunkIdsForFile.size())
+                        .fileModifiedAt(getFileModifiedTime(resource))
+                        .version(1)
+                        .build());
+                    log.info("【ETL-Index】索引记录建立: {} → {} 个 chunk, hash={}",
+                        filename, chunkIdsForFile.size(), contentHash.substring(0, 8));
+                }
+            } catch (Exception e) {
+                log.error("【ETL-Index】建立索引失败 {}: {}", resource.getFilename(), e.getMessage());
+            }
         }
 
         return allDocuments.size();
+    }
+
+    // ========================
+    // 增量同步辅助方法
+    // ========================
+
+    /**
+     * 删除指定源文件的所有旧向量（通过 PgVector metadata->>'source' 定位）
+     */
+    private void deleteChunksBySource(String sourceFile, KnowledgeBaseIndex oldIndex) {
+        // 方案A: 通过 chunk IDs 定向删除（精确）
+        List<String> chunkIds = parseChunkIds(oldIndex.getChunkIds());
+        if (!chunkIds.isEmpty()) {
+            try {
+                vectorStore.delete(chunkIds);
+                log.info("【ETL-Clean】删除旧向量: {} ({})", sourceFile, chunkIds.size());
+            } catch (Exception e) {
+                // delete 可能不支持，降级为 SQL 直接删除
+                log.warn("【ETL-Clean】vectorStore.delete 失败，使用 SQL 回退: {}", e.getMessage());
+                deleteBySourceSQL(sourceFile);
+            }
+        }
+        // 删除索引记录
+        indexRepository.deleteBySourceFile(sourceFile);
+    }
+
+    /**
+     * SQL 回退方案：直接 DELETE FROM vector_store WHERE metadata->>'source' = ?
+     */
+    private void deleteBySourceSQL(String sourceFile) {
+        try {
+            int deleted = jdbcTemplate.update(
+                "DELETE FROM vector_store WHERE metadata->>'source' = ?", sourceFile);
+            log.info("【ETL-Clean-SQL】删除旧向量: {} ({} 行)", sourceFile, deleted);
+        } catch (Exception e) {
+            log.error("【ETL-Clean-SQL】失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 解析 chunk IDs JSON 数组（兼容两种格式）
+     * 格式1: ["id1","id2"]
+     * 格式2: ["id1", "id2"]（带空格）
+     */
+    private List<String> parseChunkIds(String chunkIdsJson) {
+        if (chunkIdsJson == null || chunkIdsJson.isBlank()) {
+            return Collections.emptyList();
+        }
+        // 去掉首尾的 []，按逗号分割，去掉引号和空格
+        String inner = chunkIdsJson.trim();
+        if (inner.startsWith("[") && inner.endsWith("]")) {
+            inner = inner.substring(1, inner.length() - 1);
+        }
+        return Arrays.stream(inner.split(","))
+            .map(s -> s.trim().replaceAll("^\"|\"$", ""))
+            .filter(s -> !s.isEmpty())
+            .collect(Collectors.toList());
+    }
+
+    /**
+     * 计算文本的 MD5 哈希（用于内容变更检测）
+     */
+    private String computeMD5(String text) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] digest = md.digest(text.getBytes("UTF-8"));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(text.hashCode());
+        }
+    }
+
+    /**
+     * 获取文件最后修改时间
+     */
+    private LocalDateTime getFileModifiedTime(Resource resource) {
+        try {
+            long lastModified = resource.lastModified();
+            return LocalDateTime.ofInstant(Instant.ofEpochMilli(lastModified), ZoneId.systemDefault());
+        } catch (Exception e) {
+            return LocalDateTime.now();
+        }
     }
 
     /**
@@ -585,7 +887,13 @@ public class DocumentEtlPipeline {
             docs = denoise(docs);
             docs = splitDocuments(docs);
             addMetadata(docs, filePath);
-            vectorStore.add(docs);
+            
+            // DashScope Embedding API 限制单次 batch 最多 10 条文档
+            int batchSize = 10;
+            for (int i = 0; i < docs.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, docs.size());
+                vectorStore.add(docs.subList(i, end));
+            }
             log.info("【ETL】文档导入成功: {} ({} 个文档块)", filePath, docs.size());
             return docs.size();
         } catch (Exception e) {

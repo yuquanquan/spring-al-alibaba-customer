@@ -101,12 +101,12 @@ public class HybridSearchService {
         
         // 1.1 向量检索
         List<Document> vectorResults = executeVectorSearch(query, INTERNAL_TOP_K);
-        log.debug("【混合检索-向量】召回 {} 个文档", vectorResults.size());
+        log.info("【混合检索-向量】召回 {} 个文档", vectorResults.size());
         
-        // 1.2 BM25 检索
+        // 1.2 全文检索（PostgreSQL tsvector，天然持久化，无需手动同步）
         List<BM25SearchEngine.SearchResult> bm25Results = 
             bm25Engine.search(query, INTERNAL_TOP_K);
-        log.debug("【混合检索-BM25】召回 {} 个文档", bm25Results.size());
+        log.info("【混合检索-全文检索】召回 {} 个文档", bm25Results.size());
         
         // ===== 步骤2: 构建排名映射 =====
         
@@ -254,27 +254,4 @@ public class HybridSearchService {
         }
     }
     
-    /**
-     * 同步 BM25 索引与向量存储
-     * <p>
-     * 当向量存储中有新文档时，需要同步添加到 BM25 索引
-     * <p>
-     * 注意：这是一个简化的实现，生产环境建议使用事件驱动或消息队列
-     *
-     * @param documents 需要同步的文档列表
-     */
-    public void syncBM25Index(List<Document> documents) {
-        log.info("【BM25同步】开始同步 {} 个文档到 BM25 索引", documents.size());
-        
-        Map<String, String> docMap = new HashMap<>();
-        for (Document doc : documents) {
-            if (doc.getId() != null && doc.getText() != null) {
-                docMap.put(doc.getId(), doc.getText());
-            }
-        }
-        
-        bm25Engine.bulkAddDocuments(docMap);
-        
-        log.info("【BM25同步】完成，BM25 索引统计: {}", bm25Engine.getStats());
-    }
 }

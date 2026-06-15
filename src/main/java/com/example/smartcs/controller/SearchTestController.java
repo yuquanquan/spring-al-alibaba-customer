@@ -98,24 +98,16 @@ public class SearchTestController {
     }
 
     /**
-     * 手动添加测试文档到 BM25 索引
+     * 手动添加测试文档到向量库（tsvector 全文索引自动维护）
      * <p>
-     * 用于快速测试，无需重新初始化整个知识库
+     * BM25 已升级为 PostgreSQL tsvector，索引由数据库自动维护。
+     * 如需测试全文检索效果，请通过 /api/docs/init 或 /api/docs/sync 导入文档。
      */
     @PostMapping("/bm25/add")
     public Map<String, Object> addTestDocument(@RequestBody Map<String, String> document) {
-        String docId = document.get("id");
-        String content = document.get("content");
-
-        if (docId == null || content == null) {
-            return Map.of("error", "需要提供 id 和 content 字段");
-        }
-
-        bm25Engine.addDocument(docId, content);
         return Map.of(
-            "status", "success",
-            "docId", docId,
-            "stats", bm25Engine.getStats()
+            "status", "deprecated",
+            "message", "BM25 已升级为 PostgreSQL tsvector，索引自动维护，无需手动添加文档。请使用 POST /api/docs/init 导入知识库。"
         );
     }
 }
